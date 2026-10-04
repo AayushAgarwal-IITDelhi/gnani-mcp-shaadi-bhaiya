@@ -6,6 +6,9 @@ Tools:
 
 Run:  uvicorn server:app --host 0.0.0.0 --port $PORT
 """
+import base64
+import hmac
+import logging
 import os
 import time
 import uuid
@@ -150,18 +153,49 @@ async def get_audio(request: Request) -> Response:
     return Response(content=item[1], media_type=item[2])
 
 
-class BearerAuth(BaseHTTPMiddleware):
+log = logging.getLogger("gnani-mcp")
+
+_TOKEN_HEADERS = ("x-api-key", "x-api-key-id", "api-key", "x-auth-token")
+
+
+def _presented_tokens(request: Request) -> list[str]:
+    """Collect every credential the caller sent, in any common form.
+
+    The portal's auth-type dropdown (Api Key / Basic / Custom ...) may send the secret
+    as a Bearer token, an API-key header, or a Basic password, so accept all of them.
+    """
+    tokens: list[str] = []
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        tokens.append(auth[7:].strip())
+    elif auth.lower().startswith("basic "):
+        try:
+            user, _, pw = base64.b64decode(auth[6:]).decode().partition(":")
+            tokens += [user, pw]
+        except Exception:
+            pass
+    for h in _TOKEN_HEADERS:
+        v = request.headers.get(h)
+        if v:
+            tokens.append(v.strip())
+    return tokens
+
+
+class TokenAuth(BaseHTTPMiddleware):
     """Protect /mcp with a shared secret when MCP_BEARER_TOKEN is set."""
 
     async def dispatch(self, request: Request, call_next):
         if MCP_BEARER_TOKEN and request.url.path.startswith("/mcp"):
-            if request.headers.get("authorization") != f"Bearer {MCP_BEARER_TOKEN}":
+            ok = any(hmac.compare_digest(t, MCP_BEARER_TOKEN) for t in _presented_tokens(request))
+            if not ok:
+                # Log header NAMES only (never values) to help debug portal auth settings.
+                log.warning("401 on /mcp; headers received: %s", sorted(request.headers.keys()))
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 
 
 app = mcp.streamable_http_app()
-app.add_middleware(BearerAuth)
+app.add_middleware(TokenAuth)
 
 if __name__ == "__main__":
     import uvicorn
